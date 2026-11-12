@@ -60,9 +60,9 @@ Type `/exit` to quit or `/reset` to clear conversation history. The terminal str
 
 ## Tool structure
 
-Built-in tools live in `qwen_agent/tools/dispatcher.py`. Generic filesystem tools (`list_files`, `read_file`, `search_files`, `write_file`, and `edit_file`) can work across multiple projects inside `WORKSPACE_ROOT`. The default is the parent of `local-qwen-agent`, so sibling folders are available. Paths passed to tools are relative to that workspace root; include a project folder in the path when needed. Set `WORKSPACE_ROOT` in `.env` to choose a different workspace. Relative values are resolved from this folder.
+Built-in tools live in `qwen_agent/tools/dispatcher.py`. At startup, the CLI asks whether to grant this session access to `WORKSPACE_ROOT`. If allowed, it scans the workspace at startup and refreshes a bounded file inventory before every request. The model receives that inventory and can use generic filesystem tools (`list_files`, `read_file`, `search_files`, `write_file`, and `edit_file`) across multiple projects inside the workspace. The default is the parent of `local-qwen-agent`, so sibling folders are available. Paths are relative to that workspace root; include a project folder in the path when needed. Set `WORKSPACE_ROOT` in `.env` to choose a different workspace. Relative values are resolved from this folder.
 
-The filesystem tools skip dependency/build folders, reject symlinks and paths outside the workspace root, limit file size, and do not expose `.env` secrets. They do not delete files or run shell commands.
+The filesystem tools skip dependency/build folders, reject symlinks and paths outside the workspace root, limit file size, and do not expose `.env` secrets. The `run_bash` tool supports read-only discovery commands (`rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `wc`, and `pwd`); commands run without a shell, path escapes are rejected, and recursive grep, file writes, and command-execution options are blocked. The agent does not delete files or run arbitrary shell commands.
 
 Qwen is instructed to inspect relevant files before making edits and to edit only when the user asks for a change. The dispatcher passes tool names, descriptions, and argument schemas to Ollama, then routes selected calls. To add a tool, register it with `ToolDispatcher.register_tool(...)`.
 

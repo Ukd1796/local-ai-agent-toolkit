@@ -126,8 +126,9 @@ def _calculate(node: ast.AST, depth: int = 0) -> int | float:
 class ToolDispatcher:
     """Registers tool descriptions and routes model tool calls to their handlers."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, workspace_access: bool = False) -> None:
         self.settings = settings
+        self.workspace_access = workspace_access
         self.filesystem = WorkspaceFiles(settings.workspace_root)
         self._tools: dict[str, dict[str, Any]] = {}
         self.register_tool(
@@ -175,6 +176,7 @@ class ToolDispatcher:
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
             }},
             handler=self.filesystem.list_files,
+            workspace_only=True,
         )
         self.register_tool(
             name="read_file",
@@ -183,6 +185,7 @@ class ToolDispatcher:
                 "path": {"type": "string", "description": "Path relative to the configured workspace root; include the project folder when needed"},
             }, "required": ["path"]},
             handler=self.filesystem.read_file,
+            workspace_only=True,
         )
         self.register_tool(
             name="search_files",
@@ -193,6 +196,7 @@ class ToolDispatcher:
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
             }, "required": ["query"]},
             handler=self.filesystem.search_files,
+            workspace_only=True,
         )
         self.register_tool(
             name="write_file",
@@ -205,6 +209,7 @@ class ToolDispatcher:
                 "content": {"type": "string", "description": "Complete file contents"},
             }, "required": ["path", "content"]},
             handler=self.filesystem.write_file,
+            workspace_only=True,
         )
         self.register_tool(
             name="edit_file",
@@ -218,6 +223,20 @@ class ToolDispatcher:
                 "new_text": {"type": "string", "description": "Replacement text"},
             }, "required": ["path", "old_text", "new_text"]},
             handler=self.filesystem.edit_file,
+            workspace_only=True,
+        )
+        self.register_tool(
+            name="run_bash",
+            description=(
+                "Run one read-only Bash-style discovery command in the workspace, such as 'rg -n pattern .' or "
+                "'find . -type f -name *.py'. Only rg, grep, find, ls, cat, head, tail, wc, and pwd are allowed; "
+                "no shell operators, writes, command execution through find/rg, or paths outside the workspace."
+            ),
+            parameters={"type": "object", "properties": {
+                "command": {"type": "string", "description": "One read-only command, for example: rg -n 'ToolDispatcher' local-qwen-agent"},
+            }, "required": ["command"]},
+            handler=self._run_bash,
+            workspace_only=True,
         )
 
     def register_tool(
@@ -227,6 +246,7 @@ class ToolDispatcher:
         description: str,
         parameters: dict[str, Any],
         handler: Callable[[dict[str, Any]], Any],
+        workspace_only: bool = False,
     ) -> None:
         """Register another tool so the model can select it by name and description."""
         if not name or name in self._tools:
@@ -238,19 +258,30 @@ class ToolDispatcher:
                 "parameters": parameters,
             }},
             "handler": handler,
+            "workspace_only": workspace_only,
         }
 
     @property
     def tools(self) -> tuple[str, ...]:
-        return tuple(self._tools)
+        return tuple(
+            name for name, tool in self._tools.items()
+            if self.workspace_access or not tool["workspace_only"]
+        )
 
     def ollama_tool_definitions(self) -> list[dict[str, Any]]:
-        return [tool["definition"] for tool in self._tools.values()]
+        return [self._tools[name]["definition"] for name in self.tools]
+
+    def workspace_inventory(self) -> dict[str, Any] | None:
+        if not self.workspace_access:
+            return None
+        return self.filesystem.list_files({"limit": 100})
 
     async def dispatch(self, name: str, arguments: Any) -> str:
         tool = self._tools.get(name)
         if tool is None:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        if tool["workspace_only"] and not self.workspace_access:
+            return json.dumps({"error": "Workspace access was not granted for this session."})
         if not isinstance(arguments, Mapping):
             return json.dumps({"error": "Tool arguments must be an object."})
         try:
@@ -269,6 +300,9 @@ class ToolDispatcher:
             arguments.get("domain"),
             arguments.get("recency"),
         )
+
+    async def _run_bash(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self.filesystem.run_bash, arguments)
 
     async def _get_current_time(self, arguments: dict[str, Any]) -> dict[str, str]:
         timezone = str(arguments.get("timezone", self.settings.timezone))

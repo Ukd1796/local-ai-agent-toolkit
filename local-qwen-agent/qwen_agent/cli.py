@@ -34,7 +34,17 @@ def _terminal_event(state: dict[str, str | None], event: str, text: str) -> None
         state["channel"] = None
 
 
-async def run_interactive(settings: Settings) -> None:
+async def run_interactive(settings: Settings, *, workspace_access: bool = False) -> None:
+    dispatcher = ToolDispatcher(settings, workspace_access=workspace_access)
+    if workspace_access:
+        inventory = await asyncio.to_thread(dispatcher.workspace_inventory)
+        files = inventory.get("files", []) if inventory else []
+        directories = inventory.get("directories", []) if inventory else []
+        print(f"Workspace access granted: {settings.workspace_root}")
+        print(f"Initial scan found {len(directories)} folders and {len(files)} files" + (" (list capped)." if inventory and inventory.get("truncated") else "."))
+    else:
+        print("Workspace access not granted; local file and command tools are disabled.")
+
     ollama = LocalOllama(settings)
     try:
         await ollama.check_model()
@@ -44,11 +54,11 @@ async def run_interactive(settings: Settings) -> None:
             "Make sure Ollama is running and the configured model is pulled."
         ) from exc
 
-    dispatcher = ToolDispatcher(settings)
     agent = Agent(settings, dispatcher, ollama)
     print("Local Qwen Research Agent")
     print(f"Model: {settings.ollama_model}")
-    print(f"Workspace: {settings.workspace_root}")
+    if workspace_access:
+        print(f"Workspace: {settings.workspace_root}")
     print("Search: Tavily API (direct)")
     print("Available tools:")
     for name in dispatcher.tools:
@@ -96,8 +106,17 @@ def main() -> None:
         level=logging.DEBUG if settings.verbose else logging.INFO,
         format="%(message)s",
     )
+    print(f"Workspace access request: {settings.workspace_root}")
+    print("If granted, the agent can list, read, search, create, and edit files in this workspace.")
+    print("It will only make file changes when you ask it to change something.")
+    print("It can also run limited read-only discovery commands (rg, grep, find, ls, cat, head, tail, wc, pwd).")
     try:
-        asyncio.run(run_interactive(settings))
+        response = input("Allow workspace access for this session? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        response = ""
+    workspace_access = response in {"y", "yes"}
+    try:
+        asyncio.run(run_interactive(settings, workspace_access=workspace_access))
     except RuntimeError as exc:
         raise SystemExit(f"Startup error: {exc}") from exc
     except KeyboardInterrupt:
