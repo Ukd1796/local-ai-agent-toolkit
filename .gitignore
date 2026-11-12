@@ -1,0 +1,46 @@
+# Secrets and local environment configuration
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Logs and temporary/editor files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local editor and operating system files
+.idea/
+.vscode/mcp.json
+.DS_Store
+Thumbs.db

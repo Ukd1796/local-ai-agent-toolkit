@@ -1,0 +1,20 @@
+[project]
+name = "local-web-mcp"
+version = "0.1.0"
+description = "A small MCP web search and page reading server for local LLM clients"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "httpx>=0.27,<1",
+    "mcp>=1.28,<2",
+]
+
+[project.scripts]
+local-web-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]

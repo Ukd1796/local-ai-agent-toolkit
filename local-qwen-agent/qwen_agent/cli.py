@@ -1,0 +1,104 @@
+"""Command-line interface for the local Qwen agent."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import httpx
+from ollama import ResponseError
+
+from .agent import Agent
+from .config import Settings, load_settings
+from .ollama_client import LocalOllama
+from .tools import ToolDispatcher
+
+
+def _terminal_event(state: dict[str, str | None], event: str, text: str) -> None:
+    channel = state["channel"]
+    if event in {"thinking", "content"}:
+        if channel != event:
+            if channel is not None:
+                print()
+            label = "Thinking" if event == "thinking" else "Qwen"
+            print(f"\n{label}: ", end="", flush=True)
+            state["channel"] = event
+        print(text, end="", flush=True)
+    elif event == "tool_start":
+        if channel is not None:
+            print()
+        print(f"\n[tool] Calling {text}...", flush=True)
+        state["channel"] = None
+    elif event == "tool_end":
+        print(f"[tool] {text} finished.", flush=True)
+        state["channel"] = None
+
+
+async def run_interactive(settings: Settings) -> None:
+    ollama = LocalOllama(settings)
+    try:
+        await ollama.check_model()
+    except (ResponseError, httpx.HTTPError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Could not use Ollama at {settings.ollama_host}: {exc}. "
+            "Make sure Ollama is running and the configured model is pulled."
+        ) from exc
+
+    dispatcher = ToolDispatcher(settings)
+    agent = Agent(settings, dispatcher, ollama)
+    print("Local Qwen Research Agent")
+    print(f"Model: {settings.ollama_model}")
+    print(f"Workspace: {settings.workspace_root}")
+    print("Search: Tavily API (direct)")
+    print("Available tools:")
+    for name in dispatcher.tools:
+        print(f"  - {name}")
+    print("Type /exit to quit.\n")
+    print(f"Conversation context: up to {settings.max_history_turns} prior turns are retained.")
+    print("Type /reset to clear it.\n")
+
+    while True:
+        try:
+            prompt = await asyncio.to_thread(input, "You: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        prompt = prompt.strip()
+        if not prompt:
+            continue
+        if prompt.lower() in {"/exit", "/quit"}:
+            break
+        if prompt.lower() == "/reset":
+            agent.reset()
+            print("Conversation context cleared.\n")
+            continue
+        logging.info("[user] %s", prompt)
+        stream_state: dict[str, str | None] = {"channel": None}
+        try:
+            await agent.ask(
+                prompt,
+                on_event=lambda event, text: _terminal_event(stream_state, event, text),
+            )
+        except RuntimeError as exc:
+            if stream_state["channel"] is not None:
+                print()
+            print(f"Agent error: {exc}")
+            continue
+        print("\n")
+
+
+def main() -> None:
+    try:
+        settings = load_settings()
+    except ValueError as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc
+    logging.basicConfig(
+        level=logging.DEBUG if settings.verbose else logging.INFO,
+        format="%(message)s",
+    )
+    try:
+        asyncio.run(run_interactive(settings))
+    except RuntimeError as exc:
+        raise SystemExit(f"Startup error: {exc}") from exc
+    except KeyboardInterrupt:
+        print("\nGoodbye.")
