@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ make the smallest suitable change, and report the paths changed. Never invent to
         self.dispatcher = dispatcher
         self.ollama = ollama
         self.history: list[list[dict[str, Any]]] = []
+        self.last_context: tuple[list[dict[str, Any]], list[dict[str, Any]] | None, int, int | None] | None = None
 
     @staticmethod
     def _message_chars(message: dict[str, Any]) -> int:
@@ -78,6 +80,66 @@ make the smallest suitable change, and report the paths changed. Never invent to
     def _context_messages(self) -> list[dict[str, Any]]:
         return [message for turn in self.history[-self.settings.max_history_turns:] for message in turn]
 
+    def _show_context(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        current_user_index: int,
+        prompt_eval_count: int | None = None,
+    ) -> None:
+        """Display a character-based breakdown of an Ollama request payload."""
+        groups: dict[str, list[dict[str, Any]]] = {
+            "System": [], "Workspace": [], "History": [], "Current user": [], "Tool calls/results": [],
+        }
+        for index, message in enumerate(messages):
+            if message.get("role") == "system":
+                group = "Workspace" if str(message.get("content", "")).startswith(
+                    "Fresh workspace inventory collected before this request:"
+                ) else "System"
+            elif index == current_user_index:
+                group = "Current user"
+            elif index > current_user_index:
+                group = "Tool calls/results"
+            else:
+                group = "History"
+            groups[group].append(message)
+
+        def chars(value: Any) -> int:
+            return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"))) if value else 0
+
+        sizes = {name: chars(group) for name, group in groups.items()}
+        tool_chars = chars(tools)
+        total = sum(sizes.values()) + tool_chars
+        estimated_tokens = (total + 3) // 4
+        capacity = 32768
+        filled = min(10, round(10 * estimated_tokens / capacity))
+        bar = "█" * filled + "░" * (10 - filled)
+        lines = [
+            "┌──────────── QWEN CONTEXT ────────────┐",
+            f"│ System              {sizes['System']:>7,} chars      │",
+            f"│ History             {sizes['History']:>7,} chars      │",
+            f"│ Workspace           {sizes['Workspace']:>7,} chars      │",
+            f"│ Current user        {sizes['Current user']:>7,} chars      │",
+            f"│ Tool calls/results  {sizes['Tool calls/results']:>7,} chars      │",
+            f"│ Tools               {tool_chars:>7,} chars      │",
+            "│                                     │",
+            f"│ Total:              {total:>7,} chars      │",
+            f"│ Estimated tokens:   ~{estimated_tokens:<7,}           │",
+            f"│ Context: {estimated_tokens / 1000:.1f}K / 32K  [{bar}]  │",
+        ]
+        if prompt_eval_count is not None:
+            lines.insert(-1, f"│ Ollama prompt tokens: {prompt_eval_count:>6,}           │")
+        lines.append("└─────────────────────────────────────┘")
+        print("\n".join(lines), flush=True)
+
+    def show_last_context(self) -> bool:
+        """Display the most recent payload sent to Ollama, if one exists."""
+        if self.last_context is None:
+            return False
+        messages, tools, current_user_index, prompt_eval_count = self.last_context
+        self._show_context(messages, tools, current_user_index, prompt_eval_count)
+        return True
+
     @staticmethod
     def _assistant_tool_message(content: str, tool_calls: list[Any]) -> dict[str, Any]:
         calls = []
@@ -104,11 +166,17 @@ make the smallest suitable change, and report the paths changed. Never invent to
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         on_event: Callable[[str, str], None] | None,
+        current_user_index: int,
     ) -> tuple[str, list[Any]]:
         content_parts: list[str] = []
         tool_calls: list[Any] = []
+        prompt_eval_count: int | None = None
+        self.last_context = (copy.deepcopy(messages), copy.deepcopy(tools), current_user_index, None)
         try:
             async for chunk in self.ollama.stream_chat(messages, tools=tools, think=True):
+                count = getattr(chunk, "prompt_eval_count", None)
+                if count is not None:
+                    prompt_eval_count = count
                 message = chunk.message
                 thinking = getattr(message, "thinking", None) or ""
                 content = getattr(message, "content", None) or ""
@@ -122,6 +190,7 @@ make the smallest suitable change, and report the paths changed. Never invent to
                     tool_calls = list(calls)
         except (ResponseError, httpx.HTTPError) as exc:
             raise RuntimeError(f"Ollama chat failed: {exc}") from exc
+        self.last_context = (copy.deepcopy(messages), copy.deepcopy(tools), current_user_index, prompt_eval_count)
         return "".join(content_parts), tool_calls
 
     async def ask(
@@ -145,12 +214,13 @@ make the smallest suitable change, and report the paths changed. Never invent to
                     + json.dumps(inventory, ensure_ascii=False),
                 })
         messages.extend([*self._context_messages(), current_turn[0]])
+        current_user_index = len(messages) - 1
         called_tools: list[str] = []
         tool_results: list[str] = []
         tool_definitions = self.dispatcher.ollama_tool_definitions()
 
         for iteration in range(self.settings.max_tool_iterations):
-            content, tool_calls = await self._stream_chat(messages, tool_definitions, on_event)
+            content, tool_calls = await self._stream_chat(messages, tool_definitions, on_event, current_user_index)
             if not tool_calls:
                 answer = content.strip()
                 answer = answer or "Qwen returned an empty response. Please try again."
@@ -190,7 +260,7 @@ make the smallest suitable change, and report the paths changed. Never invent to
         }
         messages.append(final_instruction)
         current_turn.append(final_instruction)
-        content, _ = await self._stream_chat(messages, tools=None, on_event=on_event)
+        content, _ = await self._stream_chat(messages, tools=None, on_event=on_event, current_user_index=current_user_index)
         answer = content.strip()
         answer = answer or "Qwen returned an empty response. Please try again."
         if not content and on_event:

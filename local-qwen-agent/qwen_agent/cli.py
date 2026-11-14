@@ -66,6 +66,7 @@ async def run_interactive(settings: Settings, *, workspace_access: bool = False)
     print("Type /exit to quit.\n")
     print(f"Conversation context: up to {settings.max_history_turns} prior turns are retained.")
     print("Type /reset to clear it.\n")
+    print("Type /context to show the latest Ollama context usage.\n")
 
     while True:
         try:
@@ -81,6 +82,12 @@ async def run_interactive(settings: Settings, *, workspace_access: bool = False)
         if prompt.lower() == "/reset":
             agent.reset()
             print("Conversation context cleared.\n")
+            continue
+        if prompt.lower() == "/context":
+            if not agent.show_last_context():
+                print("No context has been sent to Ollama yet.\n")
+            else:
+                print()
             continue
         logging.info("[user] %s", prompt)
         stream_state: dict[str, str | None] = {"channel": None}
