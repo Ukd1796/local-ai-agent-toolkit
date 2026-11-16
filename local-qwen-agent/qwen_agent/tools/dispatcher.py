@@ -180,9 +180,15 @@ class ToolDispatcher:
         )
         self.register_tool(
             name="read_file",
-            description="Read a UTF-8 text file by workspace-relative path. Use before explaining or editing a file.",
+            description=(
+                "Read a UTF-8 text file by workspace-relative path. Use before explaining or editing a file. "
+                "Optional start_line and end_line select a 1-based inclusive range; omit both to read the full file. "
+                "When reading a named function or method, use its returned line as start_line and its end_line as end_line."
+            ),
             parameters={"type": "object", "properties": {
                 "path": {"type": "string", "description": "Path relative to the configured workspace root; include the project folder when needed"},
+                "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line to read (1-based)"},
+                "end_line": {"type": "integer", "minimum": 1, "description": "Optional last line to read, inclusive (1-based)"},
             }, "required": ["path"]},
             handler=self.filesystem.read_file,
             workspace_only=True,
@@ -226,16 +232,19 @@ class ToolDispatcher:
             workspace_only=True,
         )
         self.register_tool(
-            name="run_bash",
+            name="find_function_or_method",
             description=(
-                "Run one read-only Bash-style discovery command in the workspace, such as 'rg -n pattern .' or "
-                "'find . -type f -name *.py'. Only rg, grep, find, ls, cat, head, tail, wc, and pwd are allowed; "
-                "no shell operators, writes, command execution through find/rg, or paths outside the workspace."
+                "For coding tasks, use this FIRST when the user names a Python function or method and a specific file. "
+                "Finds exact function/method definitions in that one file and returns their kind, enclosing class/scope, "
+                "line range, and signature. Then call read_file on the same path, using the returned line as "
+                "start_line and returned end_line as end_line, to inspect that implementation. "
+                "This tool does not search other files or edit code."
             ),
             parameters={"type": "object", "properties": {
-                "command": {"type": "string", "description": "One read-only command, for example: rg -n 'ToolDispatcher' local-qwen-agent"},
-            }, "required": ["command"]},
-            handler=self._run_bash,
+                "path": {"type": "string", "description": "Specific Python file path relative to the workspace root"},
+                "name": {"type": "string", "description": "Exact function or method name, without parentheses"},
+            }, "required": ["path", "name"]},
+            handler=self.filesystem.find_function_or_method,
             workspace_only=True,
         )
 
@@ -300,9 +309,6 @@ class ToolDispatcher:
             arguments.get("domain"),
             arguments.get("recency"),
         )
-
-    async def _run_bash(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self.filesystem.run_bash, arguments)
 
     async def _get_current_time(self, arguments: dict[str, Any]) -> dict[str, str]:
         timezone = str(arguments.get("timezone", self.settings.timezone))

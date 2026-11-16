@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import os
-import selectors
-import shlex
-import shutil
-import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +17,6 @@ MAX_FILE_BYTES = 256_000
 MAX_LIST_RESULTS = 200
 MAX_SEARCH_RESULTS = 50
 MAX_FILES_SCANNED = 5_000
-MAX_COMMAND_OUTPUT_CHARS = 12_000
-ALLOWED_COMMANDS = {"rg", "grep", "find", "ls", "cat", "head", "tail", "wc", "pwd"}
 
 
 class WorkspaceFiles:
@@ -117,7 +111,73 @@ class WorkspaceFiles:
         relative = str(arguments.get("path", ""))
         path = self._resolve(relative)
         content = self._text_file(path)
-        return {"path": Path(relative).as_posix(), "content": content}
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        if start_line is None and end_line is None:
+            return {"path": Path(relative).as_posix(), "content": content}
+
+        for label, value in (("start_line", start_line), ("end_line", end_line)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{label} must be a positive 1-based line number")
+        start = start_line if start_line is not None else 1
+        lines = content.splitlines(keepends=True)
+        if start > len(lines):
+            raise ValueError(f"start_line {start} is past the end of the file ({len(lines)} lines)")
+        end = end_line if end_line is not None else len(lines)
+        if end < start:
+            raise ValueError("end_line must be greater than or equal to start_line")
+        end = min(end, len(lines))
+        return {
+            "path": Path(relative).as_posix(),
+            "start_line": start,
+            "end_line": end,
+            "total_lines": len(lines),
+            "content": "".join(lines[start - 1:end]),
+        }
+
+    def find_function_or_method(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Locate Python function/method definitions by exact name in one specified file."""
+        relative = str(arguments.get("path", ""))
+        name = str(arguments.get("name", "")).strip()
+        if not name or not name.isidentifier():
+            raise ValueError("name must be a valid Python function or method name")
+        path = self._resolve(relative)
+        if path.suffix != ".py":
+            raise ValueError("find_function_or_method currently supports Python (.py) files")
+        source = self._text_file(path)
+        try:
+            tree = ast.parse(source, filename=Path(relative).as_posix())
+        except SyntaxError as exc:
+            raise ValueError(f"Could not parse Python file: {exc}") from exc
+
+        matches: list[dict[str, Any]] = []
+
+        def visit(node: ast.AST, scope: tuple[str, ...] = (), in_class: bool = False) -> None:
+            for child in ast.iter_child_nodes(node):
+                child_scope = scope
+                child_in_class = in_class
+                if isinstance(child, ast.ClassDef):
+                    child_scope = (*scope, child.name)
+                    child_in_class = True
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if child.name == name:
+                        start_line = min(
+                            [child.lineno, *(decorator.lineno for decorator in child.decorator_list)]
+                        )
+                        matches.append({
+                            "kind": "method" if in_class else "function",
+                            "name": child.name,
+                            "scope": ".".join(scope) or None,
+                            "line": start_line,
+                            "end_line": child.end_lineno,
+                            "signature": source.splitlines()[child.lineno - 1].strip(),
+                        })
+                    child_scope = (*scope, child.name)
+                    child_in_class = False
+                visit(child, child_scope, child_in_class)
+
+        visit(tree)
+        return {"path": Path(relative).as_posix(), "name": name, "matches": matches}
 
     def search_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query", ""))
@@ -200,105 +260,3 @@ class WorkspaceFiles:
             raise ValueError(f"edited file exceeds the {MAX_FILE_BYTES}-byte limit")
         path.write_text(updated, encoding="utf-8")
         return {"path": Path(relative).as_posix(), "replacements": 1, "bytes_written": len(updated.encode("utf-8"))}
-
-    def run_bash(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Run one allowlisted, read-only discovery command with cwd at the workspace root."""
-        command = arguments.get("command")
-        if not isinstance(command, str) or not command.strip() or len(command) > 2_000:
-            raise ValueError("command must be a non-empty string up to 2,000 characters")
-        try:
-            parts = shlex.split(command)
-        except ValueError as exc:
-            raise ValueError(f"Could not parse command: {exc}") from exc
-        if not parts:
-            raise ValueError("command cannot be empty")
-        executable = Path(parts[0]).name
-        if executable not in ALLOWED_COMMANDS:
-            raise ValueError(f"'{executable}' is not allowed; use one of: {', '.join(sorted(ALLOWED_COMMANDS))}")
-        args = parts[1:]
-        if executable == "find" and any(
-            arg in {"-exec", "-execdir", "-delete", "-ok", "-okdir"}
-            or arg.startswith(("-fprint", "-fprintf", "-fls"))
-            for arg in args
-        ):
-            raise ValueError("find execution, deletion, and output-file actions are not allowed")
-        if executable == "grep" and any(
-            arg in {"--recursive", "-r", "-R"}
-            or (arg.startswith("-") and not arg.startswith("--") and any(flag in arg[1:] for flag in "rR"))
-            for arg in args
-        ):
-            raise ValueError("Recursive grep is disabled; use rg, which respects workspace ignore rules")
-        if executable == "rg" and any(
-            arg in {"--pre", "--hidden", "-u", "-uu", "-uuu"}
-            or arg.startswith(("--pre=", "--no-ignore")) for arg in args
-        ):
-            raise ValueError("rg options that expose ignored files or execute preprocessors are not allowed")
-        for arg in args:
-            # Commands are launched without a shell, but also reject path escapes and absolute paths.
-            value = arg.split("=", 1)[-1] if arg.startswith("-") and "=" in arg else arg
-            path_value = Path(value)
-            if path_value.is_absolute() or ".." in path_value.parts or "../" in value or value.startswith("~/"):
-                raise ValueError("command arguments must not access paths outside the workspace")
-            if self._is_private(path_value):
-                raise ValueError("Commands cannot read secret environment files")
-            possible_path = self.root / path_value
-            cursor = self.root
-            for part in path_value.parts:
-                cursor = cursor / part
-                if cursor.is_symlink():
-                    raise ValueError("Commands cannot follow symbolic links")
-            resolved = possible_path.resolve(strict=False)
-            if resolved != self.root and self.root not in resolved.parents:
-                raise ValueError("command arguments must not access paths outside the workspace")
-
-        binary = shutil.which(executable)
-        if not binary:
-            raise RuntimeError(f"Required command is not installed: {executable}")
-        process = subprocess.Popen(
-            [binary, *args],
-            cwd=self.root,
-            env={"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-        )
-        output = bytearray()
-        truncated = timed_out = False
-        deadline = time.monotonic() + 15
-        assert process.stdout is not None
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                events = selector.select(remaining)
-                if not events:
-                    timed_out = True
-                    break
-                chunk = os.read(process.stdout.fileno(), min(4096, MAX_COMMAND_OUTPUT_CHARS + 1 - len(output)))
-                if not chunk:
-                    selector.unregister(process.stdout)
-                    break
-                output.extend(chunk)
-                if len(output) > MAX_COMMAND_OUTPUT_CHARS:
-                    truncated = True
-                    break
-        if timed_out or truncated:
-            process.terminate()
-        try:
-            return_code = process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return_code = process.wait()
-        process.stdout.close()
-        decoded_output = bytes(output[:MAX_COMMAND_OUTPUT_CHARS]).decode("utf-8", errors="replace")
-        return {
-            "command": command,
-            "return_code": None if timed_out else return_code,
-            "timed_out": timed_out,
-            "output": decoded_output,
-            "output_truncated": truncated,
-        }

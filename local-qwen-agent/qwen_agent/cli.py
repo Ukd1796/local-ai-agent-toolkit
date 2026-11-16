@@ -116,7 +116,7 @@ def main() -> None:
     print(f"Workspace access request: {settings.workspace_root}")
     print("If granted, the agent can list, read, search, create, and edit files in this workspace.")
     print("It will only make file changes when you ask it to change something.")
-    print("It can also run limited read-only discovery commands (rg, grep, find, ls, cat, head, tail, wc, pwd).")
+    print("For Python code, it can locate named functions or methods in a specific file before reading them.")
     try:
         response = input("Allow workspace access for this session? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
