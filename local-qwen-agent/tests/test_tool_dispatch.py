@@ -82,6 +82,10 @@ class FakeDispatcher:
 
     def __init__(self) -> None:
         self.calls = []
+        self.workspace_access = False
+
+    def workspace_inventory(self):
+        return None
 
     def ollama_tool_definitions(self):
         return [
@@ -100,6 +104,38 @@ class FakeDispatcher:
         return json.dumps({"tool": name, "arguments": arguments, "result": "ok"})
 
 
+class WorkspaceFakeDispatcher(FakeDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.workspace_access = True
+
+    def ollama_tool_definitions(self):
+        return super().ollama_tool_definitions() + [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read workspace source.",
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                }, "required": ["path"]},
+            },
+        }]
+
+    async def dispatch(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "read_file":
+            return json.dumps({
+                "path": arguments["path"],
+                "start_line": arguments.get("start_line", 1),
+                "end_line": arguments.get("end_line", 3),
+                "total_lines": 3,
+                "content": "self.history = []\nself.history.append(messages)\nself.history.pop(0)",
+            })
+        return json.dumps({"tool": name, "arguments": arguments, "result": "ok"})
+
+
 class ToolDispatchTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def task_state_from_call(call):
@@ -108,6 +144,77 @@ class ToolDispatchTests(unittest.IsolatedAsyncioTestCase):
             if message.get("content", "").startswith("Persistent Task State")
         )
         return json.loads(message["content"].split("\n", 1)[1])
+
+    async def test_workspace_answer_requires_read_and_adds_inspected_source(self):
+        bad_draft = "The code stores turns in self._history and never trims them."
+        grounded_answer = "The agent stores turns in self.history, appends each turn, and removes the oldest when needed."
+        ollama = FakeOllama([
+            response(bad_draft, thinking="I should inspect the source before answering."),
+            response(tool_calls=[tool_call("read_file", {
+                "path": "qwen_agent/agent.py", "start_line": 75, "end_line": 98,
+            })]),
+            response(grounded_answer),
+        ])
+        dispatcher = WorkspaceFakeDispatcher()
+        agent = Agent(settings(), dispatcher, ollama)
+        events = []
+
+        result = await agent.ask(
+            "How does the agent that we have in place store the historical conversation?",
+            on_event=lambda event, text: events.append((event, text)),
+        )
+
+        expected_answer = grounded_answer + "\n\nInspected source: qwen_agent/agent.py:L75-L98"
+        self.assertEqual(result.answer, expected_answer)
+        self.assertEqual([name for name, _ in dispatcher.calls], ["read_file"])
+        self.assertEqual(result.evidence[0]["source"], "qwen_agent/agent.py")
+        self.assertTrue(result.evidence[0]["success"])
+        self.assertNotIn(bad_draft, [text for event, text in events if event == "content"])
+        self.assertIn(("thinking", "I should inspect the source before answering."), events)
+        self.assertIn(("content", expected_answer), events)
+
+    async def test_read_file_returns_requested_inclusive_line_range(self):
+        dispatcher = ToolDispatcher(settings(), workspace_access=True)
+        source_lines = (AGENT_DIR / "qwen_agent/agent.py").read_text().splitlines()
+        history_line = next(
+            line_number for line_number, line in enumerate(source_lines, 1)
+            if "self.history: list[list[dict[str, Any]]]" in line
+        )
+
+        result = json.loads(await dispatcher.dispatch("read_file", {
+            "path": "qwen_agent/agent.py",
+            "start_line": history_line,
+            "end_line": history_line,
+        }))
+
+        self.assertEqual(result["start_line"], history_line)
+        self.assertEqual(result["end_line"], history_line)
+        self.assertEqual(result["total_lines"], len(source_lines))
+        self.assertIn("self.history", result["content"])
+
+    async def test_workspace_answer_fails_closed_without_workspace_access(self):
+        ollama = FakeOllama([response("The agent stores this in self._history.")])
+        agent = Agent(settings(), FakeDispatcher(), ollama)
+
+        result = await agent.ask("How does the agent that we have in place store the historical conversation?")
+
+        self.assertIn("workspace access wasn't granted", result.answer)
+        self.assertEqual(ollama.calls, [])
+
+    async def test_workspace_answer_accepts_uncited_answer_after_source_read(self):
+        ollama = FakeOllama([
+            response(tool_calls=[tool_call("read_file", {
+                "path": "qwen_agent/agent.py", "start_line": 75, "end_line": 98,
+            })]),
+            response("The code uses self.history and trims older turns when the configured bounds are exceeded."),
+        ])
+        agent = Agent(settings(), WorkspaceFakeDispatcher(), ollama)
+
+        result = await agent.ask("How does the agent that we have in place store the historical conversation?")
+
+        self.assertEqual(len(ollama.calls), 2)
+        self.assertIn("The code uses self.history", result.answer)
+        self.assertTrue(result.answer.endswith("Inspected source: qwen_agent/agent.py:L75-L98"))
 
     async def test_initial_task_state_is_separate_and_sent_to_ollama(self):
         ollama = FakeOllama([response("I will build it.")], task_updates=[{
